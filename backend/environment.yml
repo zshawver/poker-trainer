@@ -1,11 +1,11 @@
-# TODO: Rename 'project_name' to your project name
-name: project_name
+name: poker_trainer
 channels:
   - defaults
 dependencies:
   - python=3.11
   - pip
   - pip:
+      - numpy>=1.26
       - fastapi>=0.115.0
       - uvicorn[standard]>=0.32.0
       - sqlalchemy[asyncio]>=2.0.36

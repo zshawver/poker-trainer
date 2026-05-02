@@ -3,11 +3,12 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "project-name"
+name = "poker-trainer"
 version = "0.1.0"
-description = ""  # TODO: Add project description
+description = "Backend for a poker math training program with a vectorized NumPy hand evaluator and equity engine."
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=1.26",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "sqlalchemy[asyncio]>=2.0.36",
