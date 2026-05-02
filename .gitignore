@@ -1,5 +1,58 @@
-# Temporary pre-migration .gitignore (will be replaced by template version)
+# ============================================
+# DRC Fullstack — .gitignore
+# ============================================
+
+# --- Credentials & secrets ---
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+.conda/
+*.conda
+pip-log.txt
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- Node ---
+node_modules/
+dist/
+.vite/
+
+# --- Docker ---
+*.log
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Misc ---
+*.tmp
+*.bak
+*.cache
+
+# --- Project-specific ---
 .spyproject/
 .claude/

@@ -1,0 +1,32 @@
+@import url('https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;0,900;1,400;1,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* DRC heading font — self-hosted News Gothic MT Bold */
+@font-face {
+  font-family: "Gothic News-Bold";
+  src: url("/fonts/News Gothic MT Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* DRC body font fallback — self-hosted News Gothic MT Regular */
+@font-face {
+  font-family: "Gothic News-Regular";
+  src: url("/fonts/News Gothic MT Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@layer base {
+  body {
+    @apply font-body text-counsel bg-white;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-heading;
+  }
+}
