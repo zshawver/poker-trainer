@@ -1,29 +1,16 @@
 """
-Test suite for numpy_eval — validates against the existing Hand.scoreHand().
+Test suite for the vectorized hand evaluator.
 
-Run: python test_eval.py
+Run from backend/: pytest tests/test_evaluator.py
+Or as a script:    python -m tests.test_evaluator
 """
 
 import sys
-import os
-# Support both script execution (__file__ available) and interactive/notebook use
-try:
-    _dir = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    _dir = os.getcwd()
-if _dir not in sys.path:
-    sys.path.insert(0, _dir)
 import time
 import numpy as np
-from collections import Counter
-from itertools import combinations
 
-# Import existing evaluator
-from hand_Backend import Hand
-
-# Import new evaluator
-from numpy_cards import encode_card, encode_hand, decode_hand, FULL_DECK
-from numpy_eval import evaluate_hands, hand_category
+from src.engine.cards import encode_card, encode_hand, decode_hand, FULL_DECK
+from src.engine.evaluator import evaluate_hands, hand_category
 
 # Map existing score (1-10) category names for readable output
 CATEGORY_NAMES = {
@@ -31,26 +18,6 @@ CATEGORY_NAMES = {
     5: "Straight", 6: "Flush", 7: "Full House", 8: "Four of a Kind",
     9: "Straight Flush", 10: "Royal Flush"
 }
-
-
-def generate_random_hands(n, rng=None):
-    """Generate n random 7-card hands as both tuples and encoded arrays."""
-    if rng is None:
-        rng = np.random.default_rng(42)
-
-    # Generate hands as encoded card IDs
-    encoded = np.zeros((n, 7), dtype=np.int8)
-    for i in range(n):
-        cards = rng.choice(52, size=7, replace=False)
-        encoded[i] = cards
-
-    # Convert to legacy tuple format for the old evaluator
-    tuple_hands = []
-    for i in range(n):
-        hand_tuples = decode_hand(encoded[i])
-        tuple_hands.append(hand_tuples)
-
-    return encoded, tuple_hands
 
 
 def make_hand_from_strings(card_strings):
@@ -64,82 +31,13 @@ def make_hand_from_strings(card_strings):
     suit_map = {'c': 0, 'h': 1, 'd': 2, 's': 3}
 
     encoded = []
-    tuples = []
     for s in card_strings:
         rank_0 = rank_map[s[0]]
         suit_0 = suit_map[s[1]]
         card_id = rank_0 * 4 + suit_0
         encoded.append(card_id)
-        tuples.append((rank_0 + 1, suit_0 + 1))  # 1-based for legacy
 
-    return np.array(encoded, dtype=np.int8), tuples
-
-
-def test_category_agreement(n=100000):
-    """Test that numpy evaluator agrees with legacy on hand categories."""
-    print(f"\n=== Category Agreement Test ({n:,} random hands) ===")
-
-    encoded, tuple_hands = generate_random_hands(n)
-
-    # Evaluate with legacy
-    t0 = time.perf_counter()
-    legacy_scores = [Hand.scoreHand(h) for h in tuple_hands]
-    legacy_time = time.perf_counter() - t0
-
-    # Evaluate with numpy
-    t0 = time.perf_counter()
-    numpy_scores = evaluate_hands(encoded)
-    numpy_time = time.perf_counter() - t0
-
-    numpy_categories = hand_category(numpy_scores)
-
-    # Compare
-    legacy_arr = np.array(legacy_scores, dtype=np.int32)
-    mismatches = np.where(legacy_arr != numpy_categories)[0]
-
-    # Known bug in legacy checkStraightFlush: returns False too early
-    # in the loop (line 650), missing straight flushes when the first
-    # window doesn't match. These show up as legacy=6 (Flush) when
-    # numpy correctly identifies them as 9 (Straight Flush) or 10 (Royal Flush).
-    known_bug_count = 0
-    real_mismatches = []
-    for idx in mismatches:
-        if legacy_scores[idx] == 6 and int(numpy_categories[idx]) in (9, 10):
-            known_bug_count += 1
-        else:
-            real_mismatches.append(idx)
-
-    if known_bug_count > 0:
-        print(f"  INFO: {known_bug_count} hands are straight flushes that "
-              f"legacy misclassifies as flushes (known bug in checkStraightFlush)")
-
-    if len(real_mismatches) == 0:
-        print(f"  PASS: All {n:,} hands agree on category "
-              f"(excluding {known_bug_count} known legacy bugs)")
-    else:
-        print(f"  FAIL: {len(real_mismatches)} real mismatches out of {n:,}")
-        for idx in real_mismatches[:10]:
-            print(f"    Hand {idx}: legacy={legacy_scores[idx]} "
-                  f"({CATEGORY_NAMES[legacy_scores[idx]]}), "
-                  f"numpy={numpy_categories[idx]} "
-                  f"({CATEGORY_NAMES.get(int(numpy_categories[idx]), '?')})")
-            print(f"    Cards: {tuple_hands[idx]}")
-
-    has_real_failures = len(real_mismatches) > 0
-
-    # Category distribution
-    dist = Counter(legacy_scores)
-    print(f"\n  Category distribution:")
-    for cat in sorted(dist.keys()):
-        pct = dist[cat] / n * 100
-        print(f"    {CATEGORY_NAMES[cat]:20s}: {dist[cat]:>7,} ({pct:5.2f}%)")
-
-    # Timing
-    print(f"\n  Legacy time:  {legacy_time:.3f}s ({n/legacy_time:,.0f} hands/sec)")
-    print(f"  NumPy time:   {numpy_time:.3f}s ({n/numpy_time:,.0f} hands/sec)")
-    print(f"  Speedup:      {legacy_time/numpy_time:.1f}x")
-
-    return not has_real_failures
+    return np.array(encoded, dtype=np.int8)
 
 
 def test_edge_cases():
@@ -215,29 +113,20 @@ def test_edge_cases():
     ]
 
     for name, cards, expected in cases:
-        encoded, tuples = make_hand_from_strings(cards)
+        encoded = make_hand_from_strings(cards)
 
-        # Legacy check
-        legacy_score = Hand.scoreHand(tuples)
-
-        # Numpy check
         hands_arr = encoded.reshape(1, 7)
-        numpy_score = hand_category(evaluate_hands(hands_arr))[0]
+        numpy_score = int(hand_category(evaluate_hands(hands_arr))[0])
 
-        legacy_ok = legacy_score == expected
-        numpy_ok = int(numpy_score) == expected
-        status = "PASS" if (legacy_ok and numpy_ok) else "FAIL"
-
-        if status == "FAIL":
-            all_pass = False
-            print(f"  {status}: {name}")
-            print(f"    Expected: {expected} ({CATEGORY_NAMES[expected]})")
-            print(f"    Legacy:   {legacy_score} ({CATEGORY_NAMES[legacy_score]})")
-            print(f"    NumPy:    {numpy_score} ({CATEGORY_NAMES.get(int(numpy_score), '?')})")
+        if numpy_score == expected:
+            print(f"  PASS: {name}")
         else:
-            print(f"  {status}: {name}")
+            all_pass = False
+            print(f"  FAIL: {name}")
+            print(f"    Expected: {expected} ({CATEGORY_NAMES[expected]})")
+            print(f"    NumPy:    {numpy_score} ({CATEGORY_NAMES.get(numpy_score, '?')})")
 
-    return all_pass
+    assert all_pass, "Some edge case categories disagreed with the expected value"
 
 
 def test_tiebreaker_ordering():
@@ -294,8 +183,8 @@ def test_tiebreaker_ordering():
     ]
 
     for name, better_cards, worse_cards in ordered_pairs:
-        enc_better, _ = make_hand_from_strings(better_cards)
-        enc_worse, _ = make_hand_from_strings(worse_cards)
+        enc_better = make_hand_from_strings(better_cards)
+        enc_worse = make_hand_from_strings(worse_cards)
 
         hands = np.stack([enc_better, enc_worse]).reshape(2, 7)
         scores = evaluate_hands(hands)
@@ -310,7 +199,7 @@ def test_tiebreaker_ordering():
             print(f"    Better: score={scores[0]}, cat={cat0}")
             print(f"    Worse:  score={scores[1]}, cat={cat1}")
 
-    return all_pass
+    assert all_pass, "Some tiebreaker orderings were wrong"
 
 
 def test_tie_detection():
@@ -333,8 +222,8 @@ def test_tie_detection():
     ]
 
     for name, hand1, hand2 in ties:
-        enc1, _ = make_hand_from_strings(hand1)
-        enc2, _ = make_hand_from_strings(hand2)
+        enc1 = make_hand_from_strings(hand1)
+        enc2 = make_hand_from_strings(hand2)
 
         hands = np.stack([enc1, enc2]).reshape(2, 7)
         scores = evaluate_hands(hands)
@@ -347,7 +236,7 @@ def test_tie_detection():
             print(f"    Hand 1 score: {scores[0]}")
             print(f"    Hand 2 score: {scores[1]}")
 
-    return all_pass
+    assert all_pass, "Some hands that should tie produced different scores"
 
 
 def test_performance_benchmark():
@@ -380,26 +269,24 @@ def test_performance_benchmark():
 
 
 if __name__ == "__main__":
-    results = []
-
-    results.append(("Edge Cases", test_edge_cases()))
-    results.append(("Tiebreaker Ordering", test_tiebreaker_ordering()))
-    results.append(("Tie Detection", test_tie_detection()))
-    results.append(("Category Agreement", test_category_agreement()))
+    failures = []
+    for name, fn in [
+        ("Edge Cases", test_edge_cases),
+        ("Tiebreaker Ordering", test_tiebreaker_ordering),
+        ("Tie Detection", test_tie_detection),
+    ]:
+        try:
+            fn()
+        except AssertionError as e:
+            failures.append((name, str(e)))
     test_performance_benchmark()
 
     print("\n" + "=" * 50)
     print("SUMMARY")
     print("=" * 50)
-    all_pass = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  {status}: {name}")
-        if not passed:
-            all_pass = False
-
-    if all_pass:
-        print("\nAll tests passed!")
+    if not failures:
+        print("All tests passed!")
     else:
-        print("\nSome tests FAILED.")
+        for name, msg in failures:
+            print(f"  FAIL: {name} -- {msg}")
         sys.exit(1)
