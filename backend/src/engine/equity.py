@@ -11,13 +11,13 @@ Supports:
 import os
 import json
 import numpy as np
-from numpy_cards import (
+from .cards import (
     normalize_cards, remaining_deck, enumerate_boards,
     deal_random_boards, make_hands, card_str, cards_str,
     _RANK_CHARS
 )
-from numpy_eval import evaluate_hands
-from poker_variables import rangeHands
+from .evaluator import evaluate_hands
+from .variables import rangeHands
 
 
 # ========== Preflop lookup table ==========

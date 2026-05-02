@@ -4,26 +4,18 @@ One-time precomputation of the 169x169 preflop equity lookup table.
 Generates preflop_equity.json — a matrix of win/tie/lose rates for every
 pair of the 169 canonical hand types (AA, AKs, AKo, ..., 32o).
 
-Run: python precompute_equity.py
+Run from backend/: python -m src.engine.precompute_equity
 Expected time: ~5-10 minutes depending on hardware.
 """
 
-import sys
 import os
 import json
 import time
 import numpy as np
 
-try:
-    _dir = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    _dir = os.getcwd()
-if _dir not in sys.path:
-    sys.path.insert(0, _dir)
-
-from poker_variables import rangeHands
-from numpy_cards import deal_random_boards, make_hands
-from numpy_eval import evaluate_hands
+from .variables import rangeHands
+from .cards import deal_random_boards, make_hands
+from .evaluator import evaluate_hands
 
 
 def _canonical_combo(hand_type):

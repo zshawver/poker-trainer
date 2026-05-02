@@ -17,16 +17,16 @@ Usage:
 """
 
 import numpy as np
-from numpy_cards import (
+from src.engine.cards import (
     FULL_DECK, card_str, cards_str, normalize_cards
 )
-from numpy_eval import evaluate_hands, hand_category, CATEGORY_SCALE
-from equity import (
+from src.engine.evaluator import evaluate_hands, hand_category, CATEGORY_SCALE
+from src.engine.equity import (
     equity_vs_hand, equity_vs_range,
     hand_type_from_cards, preflop_equity_vs_range, preflop_equity_lookup
 )
-from positions import Positions
-from ranges import openRaise
+from src.engine.positions import Positions
+from src.engine.ranges import openRaise
 
 # Category names for display
 _HAND_NAMES = {
@@ -99,7 +99,7 @@ class PokerGame:
         self._assign_positions()
 
         # Assign villain bots
-        from villain_bot import VillainBot, ARCHETYPE_NAMES
+        from .villain import VillainBot, ARCHETYPE_NAMES
         rng = np.random.default_rng()
         if villain_archetypes is None:
             villain_archetypes = {}

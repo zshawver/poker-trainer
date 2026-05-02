@@ -10,9 +10,9 @@ from observed betting patterns.
 """
 
 import numpy as np
-from equity import hand_type_from_cards, preflop_equity_vs_range
-from ranges import openRaise
-from poker_variables import openRaise_25PC, openRaise_50PC, handsList
+from src.engine.equity import hand_type_from_cards, preflop_equity_vs_range
+from src.engine.ranges import openRaise
+from src.engine.variables import openRaise_25PC, openRaise_50PC, handsList
 
 # ========== Archetype Profiles ==========
 

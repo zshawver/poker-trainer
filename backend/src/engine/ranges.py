@@ -1,5 +1,5 @@
 
-from positions import Positions
+from .positions import Positions
 
 def createOpenRaiseRanges():
     # Initialize the outer dictionary
