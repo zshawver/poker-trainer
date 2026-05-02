@@ -1,0 +1,5 @@
+# Temporary pre-migration .gitignore (will be replaced by template version)
+__pycache__/
+*.pyc
+.spyproject/
+.claude/
