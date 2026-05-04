@@ -30,3 +30,17 @@ See `README.md`. Local backend dev: `conda env create -f backend/environment.yml
 - No FastAPI endpoints expose the engine yet.
 - No frontend pages are wired up; the template ships with a placeholder home route.
 - `backend/Dockerfile` and `frontend/Dockerfile` are referenced by `docker-compose.yml` but do not yet exist.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub at `zshawver/poker-trainer`. Use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) — defaults, no aliases. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
