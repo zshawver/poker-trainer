@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api import auth
+from src.api import evaluate
 
 
 @asynccontextmanager
@@ -27,6 +28,7 @@ app.add_middleware(
 
 # Routers
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(evaluate.router, prefix="/api/evaluate", tags=["evaluate"])
 
 
 @app.get("/api/health")
