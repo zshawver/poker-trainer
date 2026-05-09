@@ -11,12 +11,6 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
-  redis:
-    image: redis:7
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-
   backend:
     build: ./backend
     restart: unless-stopped
@@ -26,12 +20,10 @@ services:
       - ./backend/src:/app/src
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/app
-      REDIS_URL: redis://redis:6379/0
       SECRET_KEY: change-me-in-production
       ACCESS_TOKEN_EXPIRE_MINUTES: "60"
     depends_on:
       - db
-      - redis
 
   frontend:
     build: ./frontend
@@ -42,6 +34,8 @@ services:
       - ./frontend/src:/app/src
     depends_on:
       - backend
+    profiles:
+      - frontend
 
 volumes:
   pgdata:
