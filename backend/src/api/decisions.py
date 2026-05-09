@@ -8,6 +8,7 @@ can render the result without having to track its own request state).
 from fastapi import APIRouter
 
 from src.engine.decisions import (
+    bet_ev,
     expected_value,
     fold_equity,
     minimum_defense_frequency,
@@ -15,6 +16,8 @@ from src.engine.decisions import (
     required_equity,
 )
 from src.schemas.decisions import (
+    BetEVRequest,
+    BetEVResponse,
     ExpectedValueRequest,
     ExpectedValueResponse,
     FoldEquityRequest,
@@ -51,6 +54,20 @@ async def post_required_equity(body: PotOddsRequest) -> RequiredEquityResponse:
 async def post_ev(body: ExpectedValueRequest) -> ExpectedValueResponse:
     return ExpectedValueResponse(
         expected_value=expected_value(
+            equity=body.equity,
+            pot=body.pot,
+            bet=body.bet,
+        ),
+        equity=body.equity,
+        pot=body.pot,
+        bet=body.bet,
+    )
+
+
+@router.post("/bet-ev", response_model=BetEVResponse)
+async def post_bet_ev(body: BetEVRequest) -> BetEVResponse:
+    return BetEVResponse(
+        bet_ev=bet_ev(
             equity=body.equity,
             pot=body.pot,
             bet=body.bet,

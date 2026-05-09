@@ -27,18 +27,34 @@ class RequiredEquityResponse(BaseModel):
     bet_to_call: float
 
 
-# ========== Expected value ==========
+# ========== Expected value (call EV) ==========
 
 
 class ExpectedValueRequest(BaseModel):
-    equity: float = Field(ge=0, le=1, description="Hero's equity at showdown when called.")
-    pot: float = Field(ge=0, description="Chips in the pot before the Hero's action.")
-    bet: float = Field(ge=0, description="Chips the Hero puts in.")
-    fold_freq: float = Field(default=0.0, ge=0, le=1, description="Probability Villain folds to the action.")
+    equity: float = Field(ge=0, le=1, description="Hero's equity at showdown.")
+    pot: float = Field(ge=0, description="Displayed pot (includes Villain's bet being called).")
+    bet: float = Field(ge=0, description="Chips Hero must add to call.")
 
 
 class ExpectedValueResponse(BaseModel):
     expected_value: float
+    equity: float
+    pot: float
+    bet: float
+
+
+# ========== Bet/raise EV (with fold equity) ==========
+
+
+class BetEVRequest(BaseModel):
+    equity: float = Field(ge=0, le=1, description="Hero's equity at showdown when called.")
+    pot: float = Field(ge=0, description="Displayed pot before Hero's bet/raise.")
+    bet: float = Field(ge=0, description="Chips Hero adds (raise amount above any Villain bet).")
+    fold_freq: float = Field(default=0.0, ge=0, le=1, description="Probability Villain folds to the action.")
+
+
+class BetEVResponse(BaseModel):
+    bet_ev: float
     equity: float
     pot: float
     bet: float

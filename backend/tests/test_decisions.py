@@ -3,6 +3,7 @@
 import pytest
 
 from src.engine.decisions import (
+    bet_ev,
     expected_value,
     fold_equity,
     minimum_defense_frequency,
@@ -53,38 +54,21 @@ def test_required_equity_equals_pot_odds():
 # ========== expected_value ==========
 
 
-def test_ev_pure_call_even_money():
+def test_ev_call_even_money():
     # Calling 50 into a pot of 100 (final pot 150) with 50% equity
-    # EV = 0 + 1.0 * (0.5 * 150 - 50) = 75 - 50 = 25
-    assert expected_value(equity=0.5, pot=100, bet=50, fold_freq=0.0) == pytest.approx(25.0)
+    # EV = 0.5 * 150 - 50 = 25
+    assert expected_value(equity=0.5, pot=100, bet=50) == pytest.approx(25.0)
 
 
-def test_ev_pure_fold_equity():
-    # Villain always folds → win the existing pot regardless of equity
-    assert expected_value(equity=0.0, pot=100, bet=50, fold_freq=1.0) == pytest.approx(100.0)
+def test_ev_call_always_win():
+    # 100% equity → win the existing pot
+    # EV = 1.0 * 150 - 50 = 100
+    assert expected_value(equity=1.0, pot=100, bet=50) == pytest.approx(100.0)
 
 
-def test_ev_always_win_called():
-    # 100% equity, called every time → win the existing pot
-    # EV = 0 + 1.0 * (1.0 * 150 - 50) = 150 - 50 = 100
-    assert expected_value(equity=1.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(100.0)
-
-
-def test_ev_mixed_fold_and_equity():
-    # 30% folds, 40% equity when called, pot 100, bet 50
-    # EV = 0.3 * 100 + 0.7 * (0.4 * 150 - 50)
-    #    = 30 + 0.7 * 10 = 30 + 7 = 37
-    assert expected_value(equity=0.4, pot=100, bet=50, fold_freq=0.3) == pytest.approx(37.0)
-
-
-def test_ev_zero_equity_zero_fold_loses_bet():
+def test_ev_call_zero_equity_loses_bet():
     # Dead money — bet is just lost
-    assert expected_value(equity=0.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(-50.0)
-
-
-def test_ev_default_fold_freq_is_zero():
-    # Default kwarg matches explicit 0.0
-    assert expected_value(0.5, 100, 50) == expected_value(0.5, 100, 50, fold_freq=0.0)
+    assert expected_value(equity=0.0, pot=100, bet=50) == pytest.approx(-50.0)
 
 
 @pytest.mark.parametrize(
@@ -93,12 +77,51 @@ def test_ev_default_fold_freq_is_zero():
 )
 def test_ev_breaks_even_at_required_equity(pot, bet_to_call):
     # Regression: pot_odds defines the break-even equity for a call,
-    # so plugging required_equity into expected_value with no fold
-    # equity must return 0. This pins the EV formula to the same
-    # `pot`-semantics as pot_odds / required_equity.
+    # so plugging required_equity into expected_value must return 0.
+    # This pins the EV formula to the same `pot`-semantics as pot_odds.
     eq = required_equity(pot, bet_to_call)
-    ev = expected_value(equity=eq, pot=pot, bet=bet_to_call, fold_freq=0.0)
+    ev = expected_value(equity=eq, pot=pot, bet=bet_to_call)
     assert ev == pytest.approx(0.0, abs=1e-9)
+
+
+# ========== bet_ev ==========
+
+
+def test_bet_ev_pure_fold_equity():
+    # Villain always folds → win the existing pot regardless of equity
+    assert bet_ev(equity=0.0, pot=100, bet=50, fold_freq=1.0) == pytest.approx(100.0)
+
+
+def test_bet_ev_no_fold_zero_equity_loses_bet():
+    # Always called, never wins at showdown → lose the bet
+    assert bet_ev(equity=0.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(-50.0)
+
+
+def test_bet_ev_no_fold_full_equity_wins_pot_plus_called_bet():
+    # 100% equity, always called → win pot + Villain's matching bet
+    # EV = 0 + 1.0 * (1.0 * 200 - 50) = 150
+    assert bet_ev(equity=1.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(150.0)
+
+
+def test_bet_ev_mixed_fold_and_equity():
+    # 30% folds, 40% equity when called, pot 100, bet 50
+    # EV = 0.3 * 100 + 0.7 * (0.4 * 200 - 50)
+    #    = 30 + 0.7 * 30 = 30 + 21 = 51
+    assert bet_ev(equity=0.4, pot=100, bet=50, fold_freq=0.3) == pytest.approx(51.0)
+
+
+def test_bet_ev_default_fold_freq_is_zero():
+    # Default kwarg matches explicit 0.0
+    assert bet_ev(0.5, 100, 50) == bet_ev(0.5, 100, 50, fold_freq=0.0)
+
+
+def test_bet_ev_called_branch_doubles_bet_in_pot():
+    # bet_ev (Villain matches) must give a different called-EV than
+    # expected_value (Villain has already bet) for the same inputs:
+    # the bet_ev called pot is `pot + 2*bet`, the call EV pot is `pot + bet`.
+    eq, pot, bet = 0.5, 100.0, 50.0
+    diff = bet_ev(eq, pot, bet, fold_freq=0.0) - expected_value(eq, pot, bet)
+    assert diff == pytest.approx(eq * bet)
 
 
 # ========== fold_equity ==========
