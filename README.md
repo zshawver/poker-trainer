@@ -38,7 +38,7 @@ docker compose up --build
 
 - Frontend: http://localhost:5173
 - Backend API: http://localhost:8000
-- PostgreSQL: localhost:5432
+- PostgreSQL: localhost:5434 (mapped to container `:5432`)
 - Redis: localhost:6379
 
 ### Database migrations
@@ -48,6 +48,24 @@ cd backend
 alembic upgrade head          # apply migrations
 alembic revision --autogenerate -m "description"  # create migration
 ```
+
+### Admin: create a user
+
+There is no public signup (see `docs/adr/0004-invite-only-auth.md`). New users
+are created via the seed CLI against a running Postgres:
+
+```powershell
+cd backend
+python -m scripts.seed --create-user EMAIL PASSWORD          # regular user
+python -m scripts.seed --create-user EMAIL PASSWORD --admin  # admin user
+```
+
+### Tests
+
+Integration tests need a Postgres instance reachable at the URL in
+`TEST_DATABASE_URL` (default `postgresql+asyncpg://postgres:postgres@localhost:5434/app_test`).
+Start the docker-compose `db` service, then run pytest from `backend/`. The
+test DB is created on first run and tables are dropped at session end.
 
 ## Project layout
 
