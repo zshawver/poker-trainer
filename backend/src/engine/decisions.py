@@ -89,32 +89,40 @@ def bet_ev(
     bet: float,
     fold_freq: float = 0.0,
 ) -> float:
-    """EV in chips of betting/raising `bet` chips with given fold equity.
+    """EV in chips of an OPEN bet with given fold equity.
 
-    Models an aggressive Action: Villain folds with probability
-    `fold_freq` (Hero wins the displayed pot) or calls and the action
+    Scope: open bets only — no prior Villain bet on the current street.
+    Models an aggressive Action where Villain folds with probability
+    `fold_freq` (Hero wins the existing pot) or calls and the action
     goes to showdown for a final pot of `pot + 2*bet` (Villain matches
-    Hero's bet), where the Hero realizes `equity` of the called pot:
+    Hero's bet exactly), where the Hero realizes `equity` of the called
+    pot:
 
         EV = fold_freq * pot
            + (1 - fold_freq) * (equity * (pot + 2*bet) - bet)
+
+    Raises are out of scope: when Hero raises an existing Villain bet
+    of V by R, Hero adds V+R and Villain's call adds R, so the called
+    pot is `pot + V + 2R` — a single `bet` parameter can't price both
+    quantities. A future `raise_ev(equity, pot, hero_adds,
+    villain_call_amount, fold_freq)` helper will cover that case.
 
     Parameters
     ----------
     equity : float
         Hero's equity at showdown when called, in [0, 1].
     pot : float
-        Displayed pot at decision time (includes any prior Villain bet
-        being raised; for a pure open bet, just the existing pot).
+        Existing pot at the moment Hero opens betting (no Villain bet
+        included — there is none on this street yet).
     bet : float
-        Chips the Hero adds (raise amount above any Villain bet).
+        Chips Hero bets.
     fold_freq : float, default 0.0
-        Probability Villain folds to the action, in [0, 1].
+        Probability Villain folds to the bet, in [0, 1].
 
     Returns
     -------
     float
-        Expected chip profit/loss of the bet/raise.
+        Expected chip profit/loss of the open bet.
     """
     ev_when_called = equity * (pot + 2 * bet) - bet
     return fold_freq * pot + (1 - fold_freq) * ev_when_called

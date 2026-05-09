@@ -43,14 +43,17 @@ class ExpectedValueResponse(BaseModel):
     bet: float
 
 
-# ========== Bet/raise EV (with fold equity) ==========
+# ========== Open-bet EV (with fold equity) ==========
+# Open bets only — no prior Villain bet on the current street. Raise EV
+# requires separate hero_adds / villain_call_amount fields and is out of
+# scope for this PR.
 
 
 class BetEVRequest(BaseModel):
     equity: float = Field(ge=0, le=1, description="Hero's equity at showdown when called.")
-    pot: float = Field(ge=0, description="Displayed pot before Hero's bet/raise.")
-    bet: float = Field(ge=0, description="Chips Hero adds (raise amount above any Villain bet).")
-    fold_freq: float = Field(default=0.0, ge=0, le=1, description="Probability Villain folds to the action.")
+    pot: float = Field(ge=0, description="Existing pot before Hero opens betting (no Villain bet included).")
+    bet: float = Field(ge=0, description="Chips Hero bets.")
+    fold_freq: float = Field(default=0.0, ge=0, le=1, description="Probability Villain folds to the bet.")
 
 
 class BetEVResponse(BaseModel):
