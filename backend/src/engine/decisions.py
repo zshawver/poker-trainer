@@ -53,24 +53,27 @@ def expected_value(
     bet: float,
     fold_freq: float = 0.0,
 ) -> float:
-    """EV in chips of betting `bet` into `pot` with given fold equity.
+    """EV in chips of putting `bet` into `pot` with optional fold equity.
 
-    Models an aggressive Action: Villain folds with probability
-    `fold_freq` (winning the existing pot) or calls and goes to showdown
-    where the Hero realizes `equity` of the called pot.
+    Uses the same `pot`-semantics as `pot_odds`: `pot` is the displayed
+    pot at decision time and already includes any Villain bet the Hero
+    is responding to. With probability `fold_freq` the Villain folds and
+    the Hero wins the displayed pot; otherwise the action goes to
+    showdown for a final pot of `pot + bet` and the Hero realizes
+    `equity` of it minus the `bet` invested.
 
         EV = fold_freq * pot
-           + (1 - fold_freq) * (equity * (pot + 2*bet) - bet)
+           + (1 - fold_freq) * (equity * (pot + bet) - bet)
 
-    For a pure call, pass `fold_freq=0.0`; the formula reduces to the
-    standard call EV `equity * (pot + 2*bet) - bet`.
+    With `fold_freq=0.0` this is the standard call EV. Setting equity to
+    `required_equity(pot, bet)` returns 0 (break-even by definition).
 
     Parameters
     ----------
     equity : float
         Hero's equity at showdown when called, in [0, 1].
     pot : float
-        Chips in the pot before the Hero's action.
+        Displayed pot at decision time (includes any Villain bet faced).
     bet : float
         Chips the Hero puts in.
     fold_freq : float, default 0.0
@@ -81,7 +84,7 @@ def expected_value(
     float
         Expected chip profit/loss of the action.
     """
-    ev_when_called = equity * (pot + 2 * bet) - bet
+    ev_when_called = equity * (pot + bet) - bet
     return fold_freq * pot + (1 - fold_freq) * ev_when_called
 
 

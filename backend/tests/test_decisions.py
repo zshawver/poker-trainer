@@ -54,9 +54,9 @@ def test_required_equity_equals_pot_odds():
 
 
 def test_ev_pure_call_even_money():
-    # 50 into pot of 100 with 50% equity, no fold equity
-    # EV = 0 + 1.0 * (0.5 * (100 + 2*50) - 50) = 100 - 50 = 50
-    assert expected_value(equity=0.5, pot=100, bet=50, fold_freq=0.0) == pytest.approx(50.0)
+    # Calling 50 into a pot of 100 (final pot 150) with 50% equity
+    # EV = 0 + 1.0 * (0.5 * 150 - 50) = 75 - 50 = 25
+    assert expected_value(equity=0.5, pot=100, bet=50, fold_freq=0.0) == pytest.approx(25.0)
 
 
 def test_ev_pure_fold_equity():
@@ -65,16 +65,16 @@ def test_ev_pure_fold_equity():
 
 
 def test_ev_always_win_called():
-    # 100% equity, called every time → win pot + opponent's matching bet
-    # EV = 0 + 1.0 * (1.0 * (100 + 100) - 50) = 200 - 50 = 150
-    assert expected_value(equity=1.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(150.0)
+    # 100% equity, called every time → win the existing pot
+    # EV = 0 + 1.0 * (1.0 * 150 - 50) = 150 - 50 = 100
+    assert expected_value(equity=1.0, pot=100, bet=50, fold_freq=0.0) == pytest.approx(100.0)
 
 
 def test_ev_mixed_fold_and_equity():
     # 30% folds, 40% equity when called, pot 100, bet 50
-    # EV = 0.3 * 100 + 0.7 * (0.4 * 200 - 50)
-    #    = 30 + 0.7 * 30 = 30 + 21 = 51
-    assert expected_value(equity=0.4, pot=100, bet=50, fold_freq=0.3) == pytest.approx(51.0)
+    # EV = 0.3 * 100 + 0.7 * (0.4 * 150 - 50)
+    #    = 30 + 0.7 * 10 = 30 + 7 = 37
+    assert expected_value(equity=0.4, pot=100, bet=50, fold_freq=0.3) == pytest.approx(37.0)
 
 
 def test_ev_zero_equity_zero_fold_loses_bet():
@@ -85,6 +85,20 @@ def test_ev_zero_equity_zero_fold_loses_bet():
 def test_ev_default_fold_freq_is_zero():
     # Default kwarg matches explicit 0.0
     assert expected_value(0.5, 100, 50) == expected_value(0.5, 100, 50, fold_freq=0.0)
+
+
+@pytest.mark.parametrize(
+    "pot,bet_to_call",
+    [(100, 50), (200, 100), (15.0, 7.5), (250, 75), (1, 1)],
+)
+def test_ev_breaks_even_at_required_equity(pot, bet_to_call):
+    # Regression: pot_odds defines the break-even equity for a call,
+    # so plugging required_equity into expected_value with no fold
+    # equity must return 0. This pins the EV formula to the same
+    # `pot`-semantics as pot_odds / required_equity.
+    eq = required_equity(pot, bet_to_call)
+    ev = expected_value(equity=eq, pot=pot, bet=bet_to_call, fold_freq=0.0)
+    assert ev == pytest.approx(0.0, abs=1e-9)
 
 
 # ========== fold_equity ==========
