@@ -1,592 +1,655 @@
 """
-Clean interactive poker game API.
+Hand-rolled FSM for a poker Hand. See ADR-0005.
 
-Designed for use in Spyder / interactive Python. No pygame dependency.
-Uses the vectorized NumPy evaluator and equity calculator.
+Three layers:
+1. ``Phase`` — the 10 discrete states the FSM walks through.
+2. ``GameState`` — frozen dataclass snapshot. Transitions return a *new* GameState.
+3. ``Game`` — ergonomic wrapper. Each method validates the current Phase, then
+   replaces ``self.state`` with the next GameState.
 
-Usage:
-    game = PokerGame(['Hero', 'V1', 'V2', 'V3'], buy_in=1000)
-    hand = game.new_hand()
-    print(hand)
-    hand.my_equity()
-    hand.deal_flop()
-    hand.my_equity()
-    hand.deal_turn()
-    hand.deal_river()
-    hand.showdown()
+JSON serialization: ``Phase`` and ``Action`` subclass ``str`` so
+``dataclasses.asdict(state)`` is directly accepted by ``json.dumps``.
+
+This module is Hero-only for the moment — Villains either get driven
+explicitly by the caller (real bot logic lands in issue #7) or via the
+placeholder ``auto_advance_villains`` rule (fold facing a bet, otherwise check).
 """
 
-import numpy as np
-from src.engine.cards import (
-    FULL_DECK, card_str, cards_str, normalize_cards
-)
-from src.engine.evaluator import evaluate_hands, hand_category, CATEGORY_SCALE
-from src.engine.equity import (
-    equity_vs_hand, equity_vs_range,
-    hand_type_from_cards, preflop_equity_vs_range, preflop_equity_lookup
-)
-from src.engine.positions import Positions
-from src.engine.ranges import openRaise
+from dataclasses import dataclass, replace
+from enum import Enum
 
-# Category names for display
-_HAND_NAMES = {
-    1: "High Card", 2: "Pair", 3: "Two Pair", 4: "Three of a Kind",
-    5: "Straight", 6: "Flush", 7: "Full House", 8: "Four of a Kind",
-    9: "Straight Flush", 10: "Royal Flush"
+import numpy as np
+
+from src.engine.cards import FULL_DECK
+from src.engine.evaluator import evaluate_hands
+from src.engine.positions import Positions
+
+
+# ============================================================
+# Enums
+# ============================================================
+
+class Phase(str, Enum):
+    WaitingForBlinds = "WaitingForBlinds"
+    PreflopBetting   = "PreflopBetting"
+    WaitingForFlop   = "WaitingForFlop"
+    FlopBetting      = "FlopBetting"
+    WaitingForTurn   = "WaitingForTurn"
+    TurnBetting      = "TurnBetting"
+    WaitingForRiver  = "WaitingForRiver"
+    RiverBetting     = "RiverBetting"
+    Showdown         = "Showdown"
+    HandComplete     = "HandComplete"
+
+
+class Action(str, Enum):
+    FOLD  = "fold"
+    CHECK = "check"
+    CALL  = "call"
+    BET   = "bet"
+    RAISE = "raise"
+
+
+BETTING_PHASES: tuple[Phase, ...] = (
+    Phase.PreflopBetting, Phase.FlopBetting,
+    Phase.TurnBetting, Phase.RiverBetting,
+)
+
+# Map a WaitingFor* phase to the betting Phase it transitions into on a deal.
+_DEAL_TARGET: dict[Phase, Phase] = {
+    Phase.WaitingForFlop:  Phase.FlopBetting,
+    Phase.WaitingForTurn:  Phase.TurnBetting,
+    Phase.WaitingForRiver: Phase.RiverBetting,
+}
+
+# Map a betting Phase to the WaitingFor* (or Showdown) it advances to once
+# the round settles.
+_SETTLE_TARGET: dict[Phase, Phase] = {
+    Phase.PreflopBetting: Phase.WaitingForFlop,
+    Phase.FlopBetting:    Phase.WaitingForTurn,
+    Phase.TurnBetting:    Phase.WaitingForRiver,
+    Phase.RiverBetting:   Phase.Showdown,
 }
 
 
-class Player:
-    """A player at the table."""
-
-    def __init__(self, name, buy_in, is_hero=False):
-        self.name = name
-        self.chips = buy_in
-        self.is_hero = is_hero
-        self.position = None
-        self._hole = None  # int8 array of 2 card IDs
-        self.bot = None    # VillainBot instance or None for hero
-
-    @property
-    def hole_cards(self):
-        if self._hole is None:
-            return None
-        return tuple(cards_str(self._hole))
-
-    def __repr__(self):
-        pos = self.position or '?'
-        chips = f"${self.chips}"
-        if self._hole is not None:
-            hole = ' '.join(cards_str(self._hole))
-            return f"{self.name} ({pos}) [{hole}] {chips}"
-        return f"{self.name} ({pos}) {chips}"
+class InvalidTransition(Exception):
+    """Raised when an FSM action is attempted in an invalid Phase or against invalid state."""
 
 
-class PokerGame:
-    """Manages a multi-hand poker session."""
+# ============================================================
+# Value objects (frozen, JSON-serializable via dataclasses.asdict)
+# ============================================================
 
-    def __init__(self, player_names, buy_in=1000, hero_index=0,
-                 big_blind=10, villain_archetypes=None):
-        """Create a new poker game.
+@dataclass(frozen=True)
+class Seat:
+    name: str
+    position: str          # 'BTN', 'SB', 'BB', 'UTG', ... per Positions[n]
+    is_hero: bool
+    stack: int             # chips remaining
+    hole: tuple[int, ...]  # 0 cards before deal, 2 card-IDs after
+    is_active: bool        # False after fold; busted seats stay inactive between Hands
+    street_bet: int        # chips committed in the current betting round
+    all_in: bool
 
-        Parameters
-        ----------
-        player_names : list of str
-            Names for each player. First player is hero by default.
-        buy_in : int
-            Starting chips for each player.
-        hero_index : int
-            Which player is the hero (you). Default 0 (first).
-        big_blind : int
-            Big blind amount. Small blind is half (rounded down).
-        villain_archetypes : dict or None
-            Optional {player_name: archetype_str} mapping.
-            Unspecified villains get random archetypes.
+
+@dataclass(frozen=True)
+class ActionRecord:
+    """One Action by one seat. Blind posts are NOT Actions per CONTEXT.md."""
+    seat_name: str
+    action: Action
+    amount: int            # chips moved from stack to pot for this Action
+    phase: Phase
+
+
+@dataclass(frozen=True)
+class Decision:
+    """A Hero Action enriched with its math context.
+
+    Math fields are nullable for now — issue #4 (decision-math module) populates
+    equity / pot_odds / ev_options when it lands.
+    """
+    seat_name: str
+    action: Action
+    amount: int
+    phase: Phase
+    pot_at_decision: int
+    bet_to_call: int
+    equity: float | None = None
+    pot_odds: float | None = None
+    ev_options: dict | None = None
+
+
+@dataclass(frozen=True)
+class GameState:
+    phase: Phase
+    seats: tuple[Seat, ...]
+    to_act_idx: int                      # -1 when no seat is to act
+    board: tuple[int, ...]
+    pot: int
+    street: str | None                   # 'preflop' | 'flop' | 'turn' | 'river' | None
+    current_bet: int                     # max street_bet anyone has put in this round
+    last_aggressor_idx: int | None
+    last_raise_increment: int            # min legal next-raise = current_bet + this
+    seats_to_act: tuple[int, ...]        # remaining indices owed a turn this round
+    actions: tuple[ActionRecord, ...]
+    decisions: tuple[Decision, ...]
+    big_blind: int
+    small_blind: int
+    deck: tuple[int, ...]                # remaining cards; head is next to deal
+    dealer_idx: int
+    winners: tuple[str, ...]             # names of seats awarded the pot at HandComplete
+
+
+# ============================================================
+# Pure helpers
+# ============================================================
+
+def _seat_idx(state: GameState, name: str) -> int:
+    for i, s in enumerate(state.seats):
+        if s.name == name:
+            return i
+    raise InvalidTransition(f"Seat {name!r} not found in state")
+
+
+def _replace_seat(seats: tuple[Seat, ...], idx: int, **changes) -> tuple[Seat, ...]:
+    return seats[:idx] + (replace(seats[idx], **changes),) + seats[idx + 1:]
+
+
+def _first_to_act_preflop(seats: tuple[Seat, ...]) -> int:
+    """First active non-all-in seat after the BB (UTG at full ring)."""
+    n = len(seats)
+    bb_idx = next(i for i, s in enumerate(seats) if s.position == 'BB')
+    for offset in range(1, n + 1):
+        idx = (bb_idx + offset) % n
+        if seats[idx].is_active and not seats[idx].all_in:
+            return idx
+    return -1
+
+
+def _first_to_act_postflop(seats: tuple[Seat, ...]) -> int:
+    """First active non-all-in seat starting from the SB."""
+    n = len(seats)
+    sb_idx = next(i for i, s in enumerate(seats) if s.position == 'SB')
+    for offset in range(n):
+        idx = (sb_idx + offset) % n
+        if seats[idx].is_active and not seats[idx].all_in:
+            return idx
+    return -1
+
+
+def _full_round_order(seats: tuple[Seat, ...], start_idx: int) -> tuple[int, ...]:
+    """Active non-all-in seats in betting order, starting from start_idx, wrapping once."""
+    n = len(seats)
+    out: list[int] = []
+    for offset in range(n):
+        idx = (start_idx + offset) % n
+        s = seats[idx]
+        if s.is_active and not s.all_in:
+            out.append(idx)
+    return tuple(out)
+
+
+def _response_order(seats: tuple[Seat, ...], aggressor_idx: int) -> tuple[int, ...]:
+    """All OTHER active non-all-in seats starting from one past the aggressor."""
+    n = len(seats)
+    out: list[int] = []
+    for offset in range(1, n):
+        idx = (aggressor_idx + offset) % n
+        s = seats[idx]
+        if s.is_active and not s.all_in:
+            out.append(idx)
+    return tuple(out)
+
+
+def _all_matched(seats: tuple[Seat, ...], current_bet: int) -> bool:
+    return all(
+        s.street_bet == current_bet
+        for s in seats
+        if s.is_active and not s.all_in
+    )
+
+
+# ============================================================
+# Game wrapper
+# ============================================================
+
+class Game:
+    """Imperative shell over an immutable GameState core.
+
+    Each public method validates Phase, computes the next state, replaces
+    ``self.state``, and returns the new state. Invalid (Phase, action)
+    combinations raise ``InvalidTransition``.
+    """
+
+    state: GameState
+
+    def __init__(
+        self,
+        seat_specs: list[tuple[str, int, bool]],
+        big_blind: int = 10,
+        small_blind: int | None = None,
+        *,
+        deck: tuple[int, ...] | None = None,
+        rng: np.random.Generator | None = None,
+        dealer_idx: int = 0,
+    ):
+        """seat_specs: list of (name, buy_in, is_hero). Exactly one Hero required.
+
+        ``deck`` lets tests pin a deterministic deal order; otherwise a fresh
+        shuffle of FULL_DECK is generated. Hole cards are dealt seat-by-seat
+        from the head of the deck.
         """
-        if len(player_names) < 3 or len(player_names) > 9:
-            raise ValueError("Need 3-9 players")
+        n = len(seat_specs)
+        if n < 3 or n > 9:
+            raise ValueError(f"Need 3-9 seats, got {n}")
+        if sum(1 for _, _, h in seat_specs if h) != 1:
+            raise ValueError("Exactly one seat must be Hero")
+        if not 0 <= dealer_idx < n:
+            raise ValueError(f"dealer_idx {dealer_idx} out of range for {n} seats")
 
-        self.players = []
-        for i, name in enumerate(player_names):
-            p = Player(name, buy_in, is_hero=(i == hero_index))
-            self.players.append(p)
+        # Rotate Positions[n] so BTN sits at index dealer_idx.
+        base_positions = list(Positions[n])
+        if dealer_idx:
+            base_positions = base_positions[-dealer_idx:] + base_positions[:-dealer_idx]
 
-        self.hero = self.players[hero_index]
-        self.big_blind = big_blind
-        self.small_blind = big_blind // 2
-        self._positions = list(Positions[len(self.players)])
-        self._hand_count = 0
-        self._assign_positions()
-
-        # Assign villain bots
-        from .villain import VillainBot, ARCHETYPE_NAMES
-        rng = np.random.default_rng()
-        if villain_archetypes is None:
-            villain_archetypes = {}
-        for player in self.players:
-            if not player.is_hero:
-                arch = villain_archetypes.get(player.name)
-                if arch is None:
-                    arch = rng.choice(ARCHETYPE_NAMES)
-                player.bot = VillainBot(arch)
-
-    def _assign_positions(self):
-        for i, player in enumerate(self.players):
-            player.position = self._positions[i]
-
-    def new_hand(self):
-        """Start a new hand. Rotates positions and deals hole cards."""
-        # Remove busted players
-        self.players = [p for p in self.players if p.chips > 0]
-        if len(self.players) < 2:
-            raise RuntimeError("Not enough players with chips")
-
-        # Rotate positions
-        if self._hand_count > 0:
-            self._positions.insert(0, self._positions.pop())
-        self._positions = list(Positions.get(len(self.players),
-                                             Positions[min(Positions.keys())]))
-        if self._hand_count > 0:
-            # Apply rotation based on hand count
-            for _ in range(self._hand_count % len(self.players)):
-                self._positions.insert(0, self._positions.pop())
-        self._assign_positions()
-        self._hand_count += 1
-
-        return HandState(self)
-
-    def __repr__(self):
-        lines = [f"PokerGame ({len(self.players)} players, hand #{self._hand_count})"]
-        for p in self.players:
-            hero_mark = " *" if p.is_hero else ""
-            lines.append(f"  {p}{hero_mark}")
-        return '\n'.join(lines)
-
-
-class HandState:
-    """Tracks a single hand in progress."""
-
-    def __init__(self, game):
-        self.game = game
-        self.active_players = list(game.players)
-        self.pot = 0
-        self.big_blind = game.big_blind
-        self.small_blind = game.small_blind
-
-        # Betting state
-        self.current_bet = 0
-        self.player_bets = {p.name: 0 for p in self.active_players}
-        self.action_log = []          # [(name, action, amount), ...]
-        self._last_raiser = None      # name of last player who raised
-        self._last_raiser_position = None
-
-        # Shuffle deck and deal hole cards
-        rng = np.random.default_rng()
-        deck = rng.permutation(FULL_DECK)
-        self._deck_idx = 0
-        self._board = np.array([], dtype=np.int8)
-        self._street = 'preflop'
-
-        # Deal 2 cards to each player
-        for player in self.active_players:
-            player._hole = np.array(
-                [deck[self._deck_idx], deck[self._deck_idx + 1]],
-                dtype=np.int8
+        seats = tuple(
+            Seat(
+                name=name, position=base_positions[i], is_hero=is_hero,
+                stack=buy_in, hole=(), is_active=True,
+                street_bet=0, all_in=False,
             )
-            self._deck_idx += 2
+            for i, (name, buy_in, is_hero) in enumerate(seat_specs)
+        )
 
-        self._deck = deck
-
-        # Post blinds
-        self._post_blinds()
-
-    @property
-    def street(self):
-        return self._street
-
-    @property
-    def board(self):
-        """Current community cards as list of strings."""
-        return cards_str(self._board) if len(self._board) > 0 else []
-
-    @property
-    def board_raw(self):
-        """Current community cards as int8 array."""
-        return self._board.copy()
-
-    @property
-    def hero(self):
-        return self.game.hero
-
-    def deal_flop(self):
-        """Deal the flop (3 community cards)."""
-        if self._street != 'preflop':
-            raise RuntimeError(f"Can't deal flop from {self._street}")
-        self._deck_idx += 1  # burn
-        flop = self._deck[self._deck_idx:self._deck_idx + 3].astype(np.int8)
-        self._deck_idx += 3
-        self._board = flop
-        self._street = 'flop'
-        self._reset_street_bets()
-        return self
-
-    def deal_turn(self):
-        """Deal the turn (4th community card)."""
-        if self._street != 'flop':
-            raise RuntimeError(f"Can't deal turn from {self._street}")
-        self._deck_idx += 1  # burn
-        turn = self._deck[self._deck_idx:self._deck_idx + 1].astype(np.int8)
-        self._deck_idx += 1
-        self._board = np.concatenate([self._board, turn])
-        self._street = 'turn'
-        self._reset_street_bets()
-        return self
-
-    def deal_river(self):
-        """Deal the river (5th community card)."""
-        if self._street != 'turn':
-            raise RuntimeError(f"Can't deal river from {self._street}")
-        self._deck_idx += 1  # burn
-        river = self._deck[self._deck_idx:self._deck_idx + 1].astype(np.int8)
-        self._deck_idx += 1
-        self._board = np.concatenate([self._board, river])
-        self._street = 'river'
-        self._reset_street_bets()
-        return self
-
-    def deal_to_river(self):
-        """Deal all remaining streets at once."""
-        if self._street == 'preflop':
-            self.deal_flop()
-        if self._street == 'flop':
-            self.deal_turn()
-        if self._street == 'turn':
-            self.deal_river()
-        return self
-
-    def fold(self, player_name):
-        """Remove a player from the hand."""
-        player = self._find_player(player_name)
-        self.active_players.remove(player)
-        self.action_log.append((player_name, 'fold', 0))
-        # Auto-award pot if only one player remains
-        if len(self.active_players) == 1:
-            winner = self.active_players[0]
-            winner.chips += self.pot
-            self.pot = 0
-        return self
-
-    def check(self, player_name):
-        """Player checks (no bet to call, or already matched)."""
-        self.action_log.append((player_name, 'check', 0))
-        return self
-
-    def call(self, player_name):
-        """Player calls the current bet."""
-        player = self._find_player(player_name)
-        already_in = self.player_bets.get(player_name, 0)
-        to_call = min(self.current_bet - already_in, player.chips)
-        if to_call <= 0:
-            return self.check(player_name)
-        player.chips -= to_call
-        self.pot += to_call
-        self.player_bets[player_name] = already_in + to_call
-        self.action_log.append((player_name, 'call', to_call))
-        if player.chips == 0:
-            print(f"{player.name} is all-in")
-        return self
-
-    def raise_to(self, player_name, total_amount):
-        """Player raises to total_amount for this street."""
-        player = self._find_player(player_name)
-        already_in = self.player_bets.get(player_name, 0)
-        to_put_in = min(total_amount - already_in, player.chips)
-        if to_put_in <= 0:
-            return self.check(player_name)
-        player.chips -= to_put_in
-        self.pot += to_put_in
-        self.player_bets[player_name] = already_in + to_put_in
-        self.current_bet = self.player_bets[player_name]
-        self._last_raiser = player_name
-        self._last_raiser_position = player.position
-        self.action_log.append((player_name, 'raise', self.current_bet))
-        if player.chips == 0:
-            print(f"{player.name} is all-in")
-        return self
-
-    def bet(self, player_name, amount):
-        """Player bets an amount (opens betting or raises)."""
-        player = self._find_player(player_name)
-        already_in = self.player_bets.get(player_name, 0)
-        actual = min(amount, player.chips)
-        player.chips -= actual
-        self.pot += actual
-        self.player_bets[player_name] = already_in + actual
-        new_level = self.player_bets[player_name]
-        if new_level > self.current_bet:
-            self.current_bet = new_level
-            self._last_raiser = player_name
-            self._last_raiser_position = player.position
-        self.action_log.append((player_name, 'bet', actual))
-        if player.chips == 0:
-            print(f"{player.name} is all-in")
-        return self
-
-    # ------------------------------------------------------------------
-    # Betting infrastructure
-    # ------------------------------------------------------------------
-
-    def _post_blinds(self):
-        """Post small and big blinds at start of hand."""
-        pos_map = {p.position: p for p in self.active_players}
-        sb_player = pos_map.get('SB')
-        bb_player = pos_map.get('BB')
-        if sb_player:
-            sb_amt = min(self.small_blind, sb_player.chips)
-            sb_player.chips -= sb_amt
-            self.pot += sb_amt
-            self.player_bets[sb_player.name] = sb_amt
-            self.action_log.append((sb_player.name, 'sb', sb_amt))
-        if bb_player:
-            bb_amt = min(self.big_blind, bb_player.chips)
-            bb_player.chips -= bb_amt
-            self.pot += bb_amt
-            self.player_bets[bb_player.name] = bb_amt
-            self.current_bet = bb_amt
-            self.action_log.append((bb_player.name, 'bb', bb_amt))
-
-    def _reset_street_bets(self):
-        """Reset per-street betting state when a new street is dealt."""
-        self.current_bet = 0
-        self.player_bets = {p.name: 0 for p in self.active_players}
-        self._last_raiser = None
-        self._last_raiser_position = None
-
-    def _betting_order(self):
-        """Return active players in betting order for current street."""
-        all_positions = list(Positions[len(self.game.players)])
-
-        if self._street == 'preflop':
-            # Preflop: UTG acts first (skip BTN, SB, BB to end)
-            while all_positions and all_positions[0] in ('BTN', 'SB', 'BB'):
-                all_positions.append(all_positions.pop(0))
+        if deck is None:
+            rng = rng or np.random.default_rng()
+            deck = tuple(int(c) for c in rng.permutation(FULL_DECK))
         else:
-            # Postflop: SB first, BTN last
-            while all_positions and all_positions[0] != 'SB':
-                all_positions.append(all_positions.pop(0))
+            deck = tuple(int(c) for c in deck)
+            if len(deck) != 52 or len(set(deck)) != 52:
+                raise ValueError("deck must be a permutation of all 52 card IDs")
 
-        active_pos = {p.position: p for p in self.active_players}
-        return [active_pos[pos] for pos in all_positions if pos in active_pos]
+        sb = small_blind if small_blind is not None else big_blind // 2
 
-    def _build_game_state(self, player):
-        """Build context dict for a villain bot's decision."""
-        return {
-            'name': player.name,
-            'hole': player._hole.copy(),
-            'board': self._board.copy(),
-            'street': self._street,
-            'position': player.position,
-            'pot': self.pot,
-            'current_bet': self.current_bet,
-            'player_bets': dict(self.player_bets),
-            'big_blind': self.big_blind,
-            'stack': player.chips,
-            'table_size': len(self.game.players),
-            'last_raiser_position': self._last_raiser_position,
-            'active_names': [p.name for p in self.active_players],
-        }
+        self.state = GameState(
+            phase=Phase.WaitingForBlinds,
+            seats=seats, to_act_idx=-1,
+            board=(), pot=0, street=None,
+            current_bet=0, last_aggressor_idx=None, last_raise_increment=0,
+            seats_to_act=(), actions=(), decisions=(),
+            big_blind=big_blind, small_blind=sb,
+            deck=deck, dealer_idx=dealer_idx, winners=(),
+        )
 
-    def play_villains(self):
-        """Run villain bot actions up to the hero's turn.
+    # --------------------------------------------------------
+    # Phase transitions
+    # --------------------------------------------------------
 
-        Iterates through players in betting order. Each villain bot
-        decides and acts automatically. Stops when it reaches the hero.
-        Returns list of (name, action, amount) for actions taken.
-        """
-        actions = []
-        self._villains_acted = set()
-        for player in self._betting_order():
-            if player.name not in [p.name for p in self.active_players]:
-                continue
-            if player.is_hero:
-                break
-            if player.bot is None:
-                continue
-            self._villains_acted.add(player.name)
-            action, amount = player.bot.decide(self._build_game_state(player))
-            self._execute_bot_action(player, action, amount)
-            actions.append((player.name, action, amount))
-            print(f"  {player.position:6s} {player.name:12s} {action}"
-                  f"{f' {amount}' if amount else ''}")
-        return actions
+    def post_blinds(self) -> GameState:
+        s = self.state
+        if s.phase != Phase.WaitingForBlinds:
+            raise InvalidTransition(f"post_blinds() invalid in phase {s.phase}")
 
-    def play_villains_after_hero(self):
-        """Run villain bot actions for players not yet acted this round.
+        n = len(s.seats)
+        # Deal hole cards seat-by-seat: seat[i] gets deck[2i:2i+2].
+        # (Round-robin would be more authentic, but seat-by-seat is easier
+        # for callers to reason about when constructing deterministic test decks.)
+        new_seats = tuple(
+            replace(s.seats[i], hole=(s.deck[2 * i], s.deck[2 * i + 1]))
+            for i in range(n)
+        )
+        deck_after_holes = s.deck[2 * n:]
 
-        Processes all bot players who weren't handled by play_villains().
-        Returns list of actions taken.
-        """
-        actions = []
-        acted = getattr(self, '_villains_acted', set())
-        for player in self._betting_order():
-            if player.is_hero:
-                continue
-            if player.name in acted:
-                continue
-            if player.name not in [p.name for p in self.active_players]:
-                continue
-            if player.bot is None:
-                continue
-            action, amount = player.bot.decide(self._build_game_state(player))
-            self._execute_bot_action(player, action, amount)
-            actions.append((player.name, action, amount))
-            print(f"  {player.position:6s} {player.name:12s} {action}"
-                  f"{f' {amount}' if amount else ''}")
-        return actions
+        sb_idx = next(i for i, x in enumerate(new_seats) if x.position == 'SB')
+        bb_idx = next(i for i, x in enumerate(new_seats) if x.position == 'BB')
 
-    def _execute_bot_action(self, player, action, amount):
-        """Execute a bot's decided action."""
-        if action == 'fold':
-            self.fold(player.name)
-        elif action == 'check':
-            self.check(player.name)
-        elif action == 'call':
-            self.call(player.name)
-        elif action == 'raise':
-            self.raise_to(player.name, amount)
-        elif action == 'bet':
-            self.bet(player.name, amount)
+        sb_amt = min(s.small_blind, new_seats[sb_idx].stack)
+        new_seats = _replace_seat(
+            new_seats, sb_idx,
+            stack=new_seats[sb_idx].stack - sb_amt,
+            street_bet=sb_amt,
+            all_in=(new_seats[sb_idx].stack - sb_amt == 0),
+        )
+        bb_amt = min(s.big_blind, new_seats[bb_idx].stack)
+        new_seats = _replace_seat(
+            new_seats, bb_idx,
+            stack=new_seats[bb_idx].stack - bb_amt,
+            street_bet=bb_amt,
+            all_in=(new_seats[bb_idx].stack - bb_amt == 0),
+        )
 
-    def my_equity(self, vs_hand=None, vs_range=None):
-        """Calculate hero's equity at the current street.
+        # Preflop walks UTG -> ... -> BB; BB acts last so they get their option.
+        seats_to_act = _full_round_order(new_seats, _first_to_act_preflop(new_seats))
 
-        Parameters
-        ----------
-        vs_hand : cards, optional
-            Specific villain hand to compare against.
-        vs_range : list of str, optional
-            Villain range as hand type names. If None, uses position-based
-            default range for first villain.
+        self.state = replace(
+            s, phase=Phase.PreflopBetting, seats=new_seats,
+            to_act_idx=seats_to_act[0] if seats_to_act else -1,
+            pot=s.pot + sb_amt + bb_amt,
+            street='preflop',
+            current_bet=bb_amt,
+            last_aggressor_idx=bb_idx,        # BB sets the implied opening "raise"
+            last_raise_increment=s.big_blind,
+            seats_to_act=seats_to_act,
+            deck=deck_after_holes,
+        )
+        return self.state
 
-        Returns
-        -------
-        dict with equity, win, tie, lose
-        """
-        hero_hole = self.hero._hole
-        board = self._board if len(self._board) > 0 else None
+    def fold(self, name: str) -> GameState:
+        return self._betting_action(name, Action.FOLD, 0)
 
-        if vs_hand is not None:
-            return equity_vs_hand(hero_hole, vs_hand, board=board)
+    def check(self, name: str) -> GameState:
+        return self._betting_action(name, Action.CHECK, 0)
 
-        if vs_range is None:
-            vs_range = self._default_villain_range()
+    def call(self, name: str) -> GameState:
+        return self._betting_action(name, Action.CALL, 0)
 
-        # Preflop: use instant lookup table (falls back to MC if table missing)
-        if self._street == 'preflop' and vs_hand is None:
-            try:
-                hero_type = hand_type_from_cards(hero_hole[0], hero_hole[1])
-                return preflop_equity_vs_range(hero_type, vs_range)
-            except (FileNotFoundError, KeyError):
-                # Fallback to Monte Carlo if lookup table not available
-                return equity_vs_range(hero_hole, vs_range, board=board,
-                                       n_samples=2000)
+    def bet(self, name: str, amount: int) -> GameState:
+        return self._betting_action(name, Action.BET, amount)
 
-        return equity_vs_range(hero_hole, vs_range, board=board)
+    def raise_to(self, name: str, total: int) -> GameState:
+        return self._betting_action(name, Action.RAISE, total)
 
-    def showdown(self):
-        """Score all remaining players and determine winner(s).
+    def _betting_action(self, name: str, action: Action, amount: int) -> GameState:
+        s = self.state
+        if s.phase not in BETTING_PHASES:
+            raise InvalidTransition(f"{action.value}() invalid in phase {s.phase}")
+        idx = _seat_idx(s, name)
+        if idx != s.to_act_idx:
+            actor = s.seats[s.to_act_idx].name if s.to_act_idx >= 0 else None
+            raise InvalidTransition(
+                f"It's not {name}'s turn (to_act={actor})"
+            )
+        seat = s.seats[idx]
+        if not seat.is_active:
+            raise InvalidTransition(f"{name} is not active in this hand")
 
-        Returns
-        -------
-        dict with 'winners' (list of Player), 'results' (list of dicts per player)
-        """
-        if len(self._board) < 5:
-            self.deal_to_river()
+        # Apply the specific action and compute the new bet bookkeeping.
+        if action == Action.FOLD:
+            new_seats = _replace_seat(s.seats, idx, is_active=False)
+            new_pot = s.pot
+            new_current_bet = s.current_bet
+            new_last_aggr = s.last_aggressor_idx
+            new_last_raise_inc = s.last_raise_increment
+            chips_in = 0
+            is_aggressive = False
 
-        if len(self.active_players) == 1:
-            winner = self.active_players[0]
-            winner.chips += self.pot
-            self.pot = 0
-            return {
-                'winners': [winner],
-                'results': [{'player': winner.name, 'hand': 'Last standing',
-                             'score': None}]
-            }
+        elif action == Action.CHECK:
+            if seat.street_bet != s.current_bet:
+                raise InvalidTransition(
+                    f"check() invalid: street_bet={seat.street_bet} != "
+                    f"current_bet={s.current_bet}"
+                )
+            new_seats = s.seats
+            new_pot = s.pot
+            new_current_bet = s.current_bet
+            new_last_aggr = s.last_aggressor_idx
+            new_last_raise_inc = s.last_raise_increment
+            chips_in = 0
+            is_aggressive = False
 
-        # Build (N, 7) hands array
-        n = len(self.active_players)
-        hands = np.zeros((n, 7), dtype=np.int8)
-        for i, player in enumerate(self.active_players):
-            hands[i, :2] = player._hole
-            hands[i, 2:] = self._board
+        elif action == Action.CALL:
+            to_call = s.current_bet - seat.street_bet
+            if to_call <= 0:
+                raise InvalidTransition(
+                    f"call() invalid: nothing to call "
+                    f"(street_bet={seat.street_bet}, current_bet={s.current_bet})"
+                )
+            chips_in = min(to_call, seat.stack)
+            new_seats = _replace_seat(
+                s.seats, idx,
+                stack=seat.stack - chips_in,
+                street_bet=seat.street_bet + chips_in,
+                all_in=(seat.stack - chips_in == 0),
+            )
+            new_pot = s.pot + chips_in
+            new_current_bet = s.current_bet
+            new_last_aggr = s.last_aggressor_idx
+            new_last_raise_inc = s.last_raise_increment
+            is_aggressive = False
+
+        elif action == Action.BET:
+            if s.current_bet != 0:
+                raise InvalidTransition(
+                    f"bet() invalid: current_bet={s.current_bet}; use raise_to()"
+                )
+            if amount < s.big_blind:
+                raise InvalidTransition(
+                    f"bet() amount {amount} below min bet (big_blind={s.big_blind})"
+                )
+            chips_in = min(amount, seat.stack)
+            new_seats = _replace_seat(
+                s.seats, idx,
+                stack=seat.stack - chips_in,
+                street_bet=seat.street_bet + chips_in,
+                all_in=(seat.stack - chips_in == 0),
+            )
+            new_pot = s.pot + chips_in
+            new_current_bet = chips_in
+            new_last_aggr = idx
+            new_last_raise_inc = chips_in
+            is_aggressive = True
+
+        elif action == Action.RAISE:
+            if s.current_bet == 0:
+                raise InvalidTransition(
+                    "raise_to() invalid: nothing to raise; use bet()"
+                )
+            min_total = s.current_bet + s.last_raise_increment
+            if amount < min_total:
+                raise InvalidTransition(
+                    f"raise_to() amount {amount} below min-raise {min_total} "
+                    f"(current_bet={s.current_bet}, min_inc={s.last_raise_increment})"
+                )
+            chips_in = min(amount - seat.street_bet, seat.stack)
+            new_total = seat.street_bet + chips_in
+            new_seats = _replace_seat(
+                s.seats, idx,
+                stack=seat.stack - chips_in,
+                street_bet=new_total,
+                all_in=(seat.stack - chips_in == 0),
+            )
+            new_pot = s.pot + chips_in
+            new_last_raise_inc = new_total - s.current_bet
+            new_current_bet = new_total
+            new_last_aggr = idx
+            is_aggressive = True
+
+        else:
+            raise InvalidTransition(f"Unknown action {action}")
+
+        # Append to action log.
+        new_actions = s.actions + (
+            ActionRecord(seat_name=name, action=action, amount=chips_in, phase=s.phase),
+        )
+
+        # If Hero acted, record a Decision (math fields stay None until issue #4).
+        new_decisions = s.decisions
+        if seat.is_hero:
+            new_decisions = s.decisions + (
+                Decision(
+                    seat_name=name, action=action, amount=chips_in, phase=s.phase,
+                    pot_at_decision=s.pot,
+                    bet_to_call=max(0, s.current_bet - seat.street_bet),
+                ),
+            )
+
+        # Single survivor: hand ends now, pot to the survivor, no showdown.
+        active_count = sum(1 for x in new_seats if x.is_active)
+        if active_count == 1:
+            winner = next(i for i, x in enumerate(new_seats) if x.is_active)
+            new_seats = _replace_seat(
+                new_seats, winner,
+                stack=new_seats[winner].stack + new_pot,
+            )
+            self.state = replace(
+                s, phase=Phase.HandComplete, seats=new_seats,
+                to_act_idx=-1, pot=0,
+                current_bet=new_current_bet, last_aggressor_idx=new_last_aggr,
+                last_raise_increment=new_last_raise_inc,
+                seats_to_act=(), actions=new_actions, decisions=new_decisions,
+                winners=(new_seats[winner].name,),
+            )
+            return self.state
+
+        # Update remaining-to-act queue.
+        if is_aggressive:
+            seats_to_act = _response_order(new_seats, idx)
+        else:
+            seats_to_act = tuple(
+                i for i in s.seats_to_act
+                if i != idx and new_seats[i].is_active and not new_seats[i].all_in
+            )
+
+        # Round settled? queue empty AND every still-active non-all-in seat has matched.
+        if not seats_to_act and _all_matched(new_seats, new_current_bet):
+            return self._settle_betting(
+                s, new_seats, new_actions, new_decisions, new_pot,
+            )
+
+        next_to_act = seats_to_act[0] if seats_to_act else -1
+        self.state = replace(
+            s, seats=new_seats, to_act_idx=next_to_act,
+            pot=new_pot, current_bet=new_current_bet,
+            last_aggressor_idx=new_last_aggr,
+            last_raise_increment=new_last_raise_inc,
+            seats_to_act=seats_to_act,
+            actions=new_actions, decisions=new_decisions,
+        )
+        return self.state
+
+    def _settle_betting(
+        self, s: GameState, new_seats: tuple[Seat, ...],
+        new_actions: tuple[ActionRecord, ...],
+        new_decisions: tuple[Decision, ...],
+        new_pot: int,
+    ) -> GameState:
+        """Betting just settled — clear per-street state and advance Phase."""
+        next_phase = _SETTLE_TARGET[s.phase]
+        new_seats = tuple(replace(x, street_bet=0) for x in new_seats)
+        self.state = replace(
+            s, phase=next_phase, seats=new_seats,
+            to_act_idx=-1, pot=new_pot,
+            current_bet=0, last_aggressor_idx=None, last_raise_increment=0,
+            seats_to_act=(), actions=new_actions, decisions=new_decisions,
+        )
+        return self.state
+
+    def deal_flop(self) -> GameState:
+        return self._deal(Phase.WaitingForFlop, 3, 'flop')
+
+    def deal_turn(self) -> GameState:
+        return self._deal(Phase.WaitingForTurn, 1, 'turn')
+
+    def deal_river(self) -> GameState:
+        return self._deal(Phase.WaitingForRiver, 1, 'river')
+
+    def _deal(self, expected: Phase, n_cards: int, street: str) -> GameState:
+        s = self.state
+        if s.phase != expected:
+            raise InvalidTransition(f"deal_{street}() invalid in phase {s.phase}")
+        if len(s.deck) < n_cards + 1:
+            raise InvalidTransition(f"Deck too short to deal {street}")
+        # Burn one, then take n_cards.
+        new_deck = s.deck[1 + n_cards:]
+        new_board = s.board + s.deck[1:1 + n_cards]
+
+        seats_to_act = _full_round_order(s.seats, _first_to_act_postflop(s.seats))
+        next_phase = _DEAL_TARGET[expected]
+
+        self.state = replace(
+            s, phase=next_phase,
+            board=new_board, deck=new_deck, street=street,
+            to_act_idx=seats_to_act[0] if seats_to_act else -1,
+            current_bet=0, last_aggressor_idx=None, last_raise_increment=0,
+            seats_to_act=seats_to_act,
+        )
+
+        # Edge case: all remaining seats are all-in. No one can act, so the
+        # round trivially settles and we move toward Showdown immediately.
+        if not seats_to_act:
+            return self._settle_betting(
+                self.state, self.state.seats,
+                self.state.actions, self.state.decisions, self.state.pot,
+            )
+        return self.state
+
+    def showdown(self) -> GameState:
+        s = self.state
+        if s.phase != Phase.Showdown:
+            raise InvalidTransition(f"showdown() invalid in phase {s.phase}")
+
+        active = [i for i, x in enumerate(s.seats) if x.is_active]
+        # Defensive: a single-survivor hand should already have ended via
+        # the betting path, not by reaching Showdown.
+        if len(active) < 2:
+            winner = active[0]
+            new_seats = _replace_seat(
+                s.seats, winner,
+                stack=s.seats[winner].stack + s.pot,
+            )
+            self.state = replace(
+                s, phase=Phase.HandComplete, seats=new_seats,
+                to_act_idx=-1, pot=0, winners=(new_seats[winner].name,),
+            )
+            return self.state
+
+        # Build (k, 7) hands and score with the vectorized evaluator.
+        hands = np.zeros((len(active), 7), dtype=np.int8)
+        for k, i in enumerate(active):
+            hands[k, :2] = s.seats[i].hole
+            hands[k, 2:] = s.board
 
         scores = evaluate_hands(hands)
-        categories = hand_category(scores)
         max_score = scores.max()
-        winner_mask = scores == max_score
+        winners_local = np.where(scores == max_score)[0]
+        winner_seat_idxs = [active[k] for k in winners_local]
 
-        # Build results
-        results = []
-        winners = []
-        for i, player in enumerate(self.active_players):
-            cat = int(categories[i])
-            is_winner = bool(winner_mask[i])
-            results.append({
-                'player': player.name,
-                'hole': ' '.join(cards_str(player._hole)),
-                'hand': _HAND_NAMES.get(cat, '?'),
-                'score': int(scores[i]),
-                'winner': is_winner,
-            })
-            if is_winner:
-                winners.append(player)
+        share = s.pot // len(winner_seat_idxs)
+        leftover = s.pot % len(winner_seat_idxs)
+        new_seats_list = list(s.seats)
+        for k, i in enumerate(winner_seat_idxs):
+            extra = 1 if k < leftover else 0
+            new_seats_list[i] = replace(
+                new_seats_list[i],
+                stack=new_seats_list[i].stack + share + extra,
+            )
+        new_seats = tuple(new_seats_list)
 
-        # Distribute pot (leftover chip goes to first winner)
-        share = self.pot // len(winners)
-        leftover = self.pot % len(winners)
-        for i, w in enumerate(winners):
-            w.chips += share + (1 if i < leftover else 0)
-        self.pot = 0
+        self.state = replace(
+            s, phase=Phase.HandComplete, seats=new_seats,
+            to_act_idx=-1, pot=0,
+            winners=tuple(s.seats[i].name for i in winner_seat_idxs),
+        )
+        return self.state
 
-        return {'winners': winners, 'results': results}
+    # --------------------------------------------------------
+    # Placeholder Villain orchestration (replaced in issue #7)
+    # --------------------------------------------------------
 
-    def _find_player(self, name):
-        for p in self.active_players:
-            if p.name == name:
-                return p
-        raise ValueError(f"Player '{name}' not found in active players")
+    def auto_advance_villains(self) -> GameState:
+        """Drive non-Hero seats with a placeholder rule until a Hero decision is needed.
 
-    def _default_villain_range(self):
-        """Get a position-appropriate opening range for the first non-hero villain."""
-        table_size = len(self.game.players)
-        if table_size not in openRaise:
-            # Fallback: top 25%
-            from poker_variables import openRaise_25PC
-            return openRaise_25PC
+        Rule: fold if facing a bet (street_bet < current_bet), otherwise check.
+        Stops when:
+        * It's Hero's turn,
+        * Phase is non-betting (WaitingFor*, Showdown, HandComplete), or
+        * The betting round just settled (no one to act).
 
-        table_ranges = openRaise[table_size]
-        # Use the first non-hero active player's position
-        for player in self.active_players:
-            if not player.is_hero and player.position in table_ranges:
-                return table_ranges[player.position]
-
-        # Fallback
-        from poker_variables import openRaise_25PC
-        return openRaise_25PC
-
-    def __repr__(self):
-        lines = []
-        lines.append(f"--- {self._street.upper()} ---")
-
-        if len(self._board) > 0:
-            lines.append(f"Board: {' '.join(cards_str(self._board))}")
-        else:
-            lines.append("Board: (none)")
-
-        lines.append(f"Pot: ${self.pot}  |  Bet to call: ${self.current_bet}")
-        lines.append("")
-
-        for player in self.active_players:
-            pos = player.position or '?'
-            hero_mark = " <-- Hero" if player.is_hero else ""
-            if player.is_hero or self._street == 'river':
-                hole = ' '.join(cards_str(player._hole))
-                lines.append(f"  {pos:6s} {player.name:12s} [{hole}]  "
-                             f"${player.chips}{hero_mark}")
+        Issue #7 swaps this for the archetype-driven VillainBot.
+        """
+        # Loop guard: max actions per Hand bounded by O(seats x streets x raises).
+        # 1000 is well above any realistic bound and catches infinite-loop bugs.
+        for _ in range(1000):
+            s = self.state
+            if s.phase not in BETTING_PHASES:
+                return s
+            if s.to_act_idx < 0:
+                return s
+            seat = s.seats[s.to_act_idx]
+            if seat.is_hero:
+                return s
+            if seat.street_bet < s.current_bet:
+                self.fold(seat.name)
             else:
-                lines.append(f"  {pos:6s} {player.name:12s} [** **]  "
-                             f"${player.chips}{hero_mark}")
-
-        # Show recent actions for this street
-        street_actions = [(n, a, amt) for n, a, amt in self.action_log
-                          if a not in ('sb', 'bb') or self._street == 'preflop']
-        if street_actions:
-            lines.append("")
-            lines.append("Actions:")
-            for name, action, amount in street_actions[-8:]:
-                if amount:
-                    lines.append(f"  {name} {action} {amount}")
-                else:
-                    lines.append(f"  {name} {action}")
-
-        return '\n'.join(lines)
+                self.check(seat.name)
+        raise InvalidTransition("auto_advance_villains: loop guard tripped")
