@@ -8,7 +8,7 @@ A poker math training program. The backend is a fast, NumPy-vectorized 7-card ha
 
 - [Anaconda](https://www.anaconda.com/) — for local backend dev
 - [Node.js](https://nodejs.org/) (v18+) — for local frontend dev (when the UI exists)
-- [Docker](https://www.docker.com/) and Docker Compose — for the full stack with Postgres/Redis
+- [Docker](https://www.docker.com/) and Docker Compose — for running the backend + Postgres stack
 
 ### Local backend dev
 
@@ -30,16 +30,18 @@ npm install
 npm run dev
 ```
 
-### Quick start (Docker, once Dockerfiles exist)
+### Quick start (Docker)
 
-```bash
+From the repo root:
+
+```powershell
 docker compose up --build
 ```
 
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:8000
+- Backend API: http://localhost:8000 (health check at `/api/health`)
 - PostgreSQL: localhost:5432
-- Redis: localhost:6379
+
+The `frontend` service is gated behind the `frontend` Compose profile until its Dockerfile lands, so it is skipped by default. Once the frontend Dockerfile exists, run `docker compose --profile frontend up --build` to bring up the SPA on http://localhost:5173.
 
 ### Database migrations
 
