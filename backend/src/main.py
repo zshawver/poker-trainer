@@ -4,7 +4,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api import auth
+from src.api import auth, decisions
 
 
 @asynccontextmanager
@@ -27,6 +27,7 @@ app.add_middleware(
 
 # Routers
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(decisions.router, prefix="/api/decisions", tags=["decisions"])
 
 
 @app.get("/api/health")
