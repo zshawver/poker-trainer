@@ -1,7 +1,10 @@
 """Integration tests for POST /api/equity.
 
-Exercises both the ``vs_hand`` and ``vs_range`` paths, the preflop lookup
-short-circuit, and the Pydantic 422 surface for malformed input.
+Exercises both the ``vs_hand`` and ``vs_range`` paths against the live
+vectorized engine (no lookup-table shortcuts at the API boundary — see PR
+#14 review for the rationale), and the Pydantic 422 surface for malformed
+input. Several assertions are deliberately tuned to fail if the endpoint
+ever regresses to a 169-type lookup dispatch.
 
 Run from backend/: pytest tests/test_api_equity.py
 """
