@@ -2,26 +2,34 @@
 
 Single endpoint: ``POST /api/equity``.
 
-Preflop calls (no board) dispatch to the precomputed 169x169 lookup table
-in ``engine.preflop_equity.json`` for instant results. Postflop calls run
-the vectorized NumPy evaluator — exhaustive on flop/turn/river, where the
-remaining-board enumeration is small enough to evaluate every completion.
+Both ``vs_hand`` and ``vs_range`` queries are evaluated against the live
+vectorized engine, not the precomputed 169-type lookup table. This preserves
+concrete-card information — blockers, suit overlap, and reduced combo counts
+all affect the result. The 169-type lookup ignores those effects and was
+deemed too lossy at the API boundary; see PR-14 review for the trade-off.
+
+The engine itself selects between exhaustive enumeration and Monte Carlo
+based on the number of remaining board cards:
+- Postflop (3+ board cards): exhaustive — every completion is evaluated.
+- Preflop ``vs_range``: per-combo Monte Carlo at the engine default.
+- Preflop ``vs_hand``: 10,000-sample Monte Carlo (avoids the ~1s exhaustive
+  enumeration over C(48, 5) board completions).
 """
 
 from fastapi import APIRouter
 
-from src.engine.cards import parse_cards
-from src.engine.equity import (
-    equity_vs_hand,
-    equity_vs_range,
-    hand_type_from_cards,
-    preflop_equity_lookup,
-    preflop_equity_vs_range,
-)
+from src.engine.equity import equity_vs_hand, equity_vs_range
 from src.schemas.equity import EquityRequest, EquityResponse
 
 
 router = APIRouter()
+
+# Preflop vs_hand sample count: 25K gives ~0.3% Monte Carlo precision on
+# the equity figure and runs in ~15ms on the vectorized evaluator. Lower
+# values (10K) are too noisy to reliably distinguish suit-overlap effects
+# in the 1-2% range, which is the whole reason we route through the live
+# engine instead of the 169-type lookup.
+_PREFLOP_VS_HAND_SAMPLES = 25_000
 
 
 @router.post("", response_model=EquityResponse)
@@ -33,30 +41,23 @@ async def calculate_equity(req: EquityRequest) -> EquityResponse:
     - ``board`` is 0/3/4/5 valid cards
     - exactly one of ``vs_hand`` / ``vs_range`` is supplied
     - all cards are distinct
+    - ``vs_range`` contains no duplicate hand types
     """
-    board = req.board or []
+    # Normalize empty/None board to None so the engine's "no board" path
+    # is unambiguous (it uses len(board)=0 internally either way).
+    board = req.board if req.board else None
 
-    if not board:
-        # Preflop — short-circuit to the precomputed lookup table.
-        # Convert the hero cards to an int8 array so we can read out card IDs.
-        hero_arr = parse_cards(req.hero)
-        hero_type = hand_type_from_cards(int(hero_arr[0]), int(hero_arr[1]))
-
-        if req.vs_hand is not None:
-            villain_arr = parse_cards(req.vs_hand)
-            villain_type = hand_type_from_cards(
-                int(villain_arr[0]), int(villain_arr[1]),
-            )
-            result = preflop_equity_lookup(hero_type, villain_type)
-        else:
-            # vs_range guaranteed non-None by EquityRequest validator.
-            result = preflop_equity_vs_range(hero_type, req.vs_range)
+    if req.vs_hand is not None:
+        # Preflop needs Monte Carlo because exhaustive enumeration over
+        # C(48, 5) = 1.7M boards is too slow for an HTTP request. Postflop
+        # lets n_samples=None so the engine picks exhaustive automatically.
+        n_samples = _PREFLOP_VS_HAND_SAMPLES if board is None else None
+        result = equity_vs_hand(
+            req.hero, req.vs_hand, board=board, n_samples=n_samples,
+        )
     else:
-        # Postflop — vectorized evaluator. 3+ cards on the board means the
-        # remaining-completion enumeration is small enough to be exhaustive.
-        if req.vs_hand is not None:
-            result = equity_vs_hand(req.hero, req.vs_hand, board=board)
-        else:
-            result = equity_vs_range(req.hero, req.vs_range, board=board)
+        # equity_vs_range handles street selection internally: per-combo
+        # Monte Carlo preflop, exhaustive once the board has 3+ cards.
+        result = equity_vs_range(req.hero, req.vs_range, board=board)
 
     return EquityResponse(**result)

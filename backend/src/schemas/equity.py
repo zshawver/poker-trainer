@@ -12,6 +12,7 @@ their inputs:
 - Exactly one of ``vs_hand`` or ``vs_range`` must be supplied.
 """
 
+from collections import Counter
 from typing import Annotated
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
@@ -73,6 +74,19 @@ class EquityRequest(BaseModel):
             unknown = [h for h in self.vs_range if h not in _HANDS_SET]
             if unknown:
                 raise ValueError(f"Unknown hand types: {unknown}")
+
+            # Reject duplicates. Ranges are semantically sets; allowing
+            # ['AA', 'AA'] would double-weight that hand type in the
+            # aggregate equity calculation because the engine accumulates
+            # per list entry. Explicit rejection avoids silent re-weighting.
+            dupes = sorted(
+                ht for ht, count in Counter(self.vs_range).items()
+                if count > 1
+            )
+            if dupes:
+                raise ValueError(
+                    f"Duplicate hand types in `vs_range`: {dupes}",
+                )
 
         # No card may appear twice across hero + board + vs_hand.
         all_cards: list[str] = list(self.hero) + list(board)
